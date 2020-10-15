@@ -2372,14 +2372,21 @@ class ConversationalPipeline(Pipeline):
         conversational_pipeline([conversation_1, conversation_2])
     """
 
-    def __init__(self, min_length_for_response=32, *args, **kwargs):
+    def __init__(self, min_length_for_response=None, max_length_for_response=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         assert self.tokenizer.eos_token_id is not None, "DialoguePipeline tokenizer should have an EOS token set"
         if self.tokenizer.pad_token_id is not None:
             self.pad_token_id = self.tokenizer.pad_token_id
         else:
             self.pad_token_id = self.tokenizer.eos_token_id
-        self.min_length_for_response = min_length_for_response
+        if min_length_for_response is None:
+            self.min_length_for_response = self.model.config.min_length
+        else:
+            self.min_length_for_response = min_length_for_response
+        if max_length_for_response is None:
+            self.max_length_for_response = self.model.config.max_length
+        else:
+            self.max_length_for_response = max_length_for_response
 
     def __call__(
         self,
@@ -2429,8 +2436,9 @@ class ConversationalPipeline(Pipeline):
 
             inputs = self._parse_and_tokenize([conversation.new_user_input for conversation in conversations])
             histories = [conversation.history for conversation in conversations]
-            max_length = generate_kwargs.get("max_length", self.model.config.max_length)
-            inputs = self._concat_inputs_history(inputs, histories, max_length)
+            min_length = generate_kwargs.get("min_length", self.min_length_for_response)
+            max_length = generate_kwargs.get("max_length", self.max_length_for_response)
+            inputs = self._concat_inputs_history(inputs, histories)
 
             if self.framework == "pt":
                 inputs = self.ensure_tensor_on_device(**inputs)
@@ -2439,14 +2447,14 @@ class ConversationalPipeline(Pipeline):
             elif self.framework == "tf":
                 input_length = tf.shape(inputs["input_ids"])[-1].numpy()
 
-            if input_length > 0.9 * max_length:
-                logger.warning(
-                    "Longest conversation length: {} is bigger than 0.9 * max_length: {}. "
-                    "You might consider trimming the early phase of the conversation".format(input_length, max_length)
-                )
+            min_length += input_length
+            max_length += input_length
+
             generated_responses = self.model.generate(
                 inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
+                min_length=min_length,
+                max_length=max_length,
                 **generate_kwargs,
             )
 
@@ -2517,16 +2525,6 @@ class ConversationalPipeline(Pipeline):
         for new_input, history in zip(inputs, histories):
             if history is not None:
                 new_input = history + new_input
-            if len(new_input) > max_length - self.min_length_for_response:
-                cutoff_eos_index = 0
-                while len(new_input) - cutoff_eos_index > max_length - self.min_length_for_response:
-                    if cutoff_eos_index >= len(new_input):
-                        break
-                    cutoff_eos_index = new_input[cutoff_eos_index:].index(self.tokenizer.eos_token_id)
-                    if cutoff_eos_index == 0 or cutoff_eos_index == len(new_input) - 1:
-                        break
-                    else:
-                        new_input = new_input[cutoff_eos_index + 1 :]
             outputs.append(new_input)
         max_len = max([len(item) for item in outputs])
         outputs = [output + [self.pad_token_id] * (max_len - len(output)) for output in outputs]
